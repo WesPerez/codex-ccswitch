@@ -24,13 +24,16 @@ exit /b %RC%
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -57,7 +60,23 @@ SETTING_OFFICIAL_AUTH = "codex_official_auth_backup_v1"
 CCSWITCH_PROCESS_NAME = "cc-switch.exe"
 CCSWITCH_APP_DIR = "CC Switch"
 
-SKIP_TOP_LEVEL_KEYS = {"model", "model_provider", "model_reasoning_effort", "notify"}
+SKIP_TOP_LEVEL_KEYS = {
+    "model",
+    "model_provider",
+    "model_reasoning_effort",
+    "notify",
+    "openai_base_url",
+    "chatgpt_base_url",
+    "personality",
+    "plan_mode_reasoning_effort",
+    "profile",
+    "service_tier",
+    "forced_login_method",
+    "forced_chatgpt_workspace_id",
+    "experimental_bearer_token",
+}
+SKIP_TOP_LEVEL_PREFIXES = ("model_", "review_model")
+SENSITIVE_TOP_LEVEL_MARKERS = ("api_key", "access_token", "refresh_token", "id_token", "password", "secret")
 REMOVE_TOP_LEVEL_KEYS: set[str] = set()
 MODEL_PROVIDER_RETRY_KEYS = ("request_max_retries", "stream_max_retries")
 SKIP_TABLE_NAMES = {
@@ -65,25 +84,36 @@ SKIP_TABLE_NAMES = {
     "mcp_servers.node_repl",
     "mcp_servers.node_repl.env",
 }
-SKIP_TABLE_PREFIXES = ("model_providers", "projects")
+SKIP_TABLE_PREFIXES = ("model_providers", "projects", "profiles", "hooks.state")
 
-EMBEDDED_PUBLIC_CONFIG = r'''model_reasoning_effort = "ultra"
-approval_policy = "never"
+REASONING_POLICIES: dict[str, tuple[set[str], str]] = {
+    "gpt-5.6-sol": ({"low", "medium", "high", "xhigh", "max", "ultra"}, "max"),
+    "gpt-5.6-terra": ({"low", "medium", "high", "xhigh", "max", "ultra"}, "max"),
+    "gpt-5.5": ({"low", "medium", "high", "xhigh"}, "xhigh"),
+    "grok-4.5": ({"low", "medium", "high"}, "high"),
+}
+REASONING_LEVEL_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+TRUSTED_CATALOG_NAME_PATTERNS = (
+    re.compile(r"^cc-switch-model-catalog(?:[-_.].*)?\.json$", re.IGNORECASE),
+    re.compile(r"^models(?:[-_.].*)?\.json$", re.IGNORECASE),
+    re.compile(r"^.+-models\.json$", re.IGNORECASE),
+)
+
+EMBEDDED_PUBLIC_CONFIG = r'''approval_policy = "never"
 sandbox_mode = "danger-full-access"
-model_catalog_json = 'C:\Users\Wes\.codex\models-wooai-supported-v0.144.4.json'
-disable_response_storage = true
+cli_auth_credentials_store = "file"
 
 [marketplaces]
 
 [marketplaces.openai-bundled]
 last_updated = "2026-06-20T20:17:38Z"
 source_type = "local"
-source = 'C:\Users\Wes\.codex\plugins\local-marketplaces\openai-bundled'
+source = '{{HOME}}\.codex\plugins\local-marketplaces\openai-bundled'
 
 [marketplaces.openai-primary-runtime]
 last_updated = "2026-06-17T02:20:08Z"
 source_type = "local"
-source = '\\?\C:\Users\Wes\.codex\plugins\cache\openai-primary-runtime'
+source = '{{HOME}}\.codex\plugins\cache\openai-primary-runtime'
 
 [marketplaces.ponytail]
 source_type = "git"
@@ -122,6 +152,8 @@ enabled = true
 conversationDetailMode = "STEPS_COMMANDS"
 ambient-suggestions-enabled = false
 followUpQueueMode = "steer"
+enabled-reasoning-efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
+show-ultra-in-model-picker-slider = true
 
 [features]
 apps = false
@@ -129,9 +161,6 @@ memories = true
 
 [windows]
 sandbox = "elevated"
-
-[projects.'e:\project\common']
-trust_level = "trusted"
 
 [memories]
 generate_memories = true
@@ -166,8 +195,16 @@ def read_text(path: Path) -> str:
 
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
+    temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def split_toml_parts(text: str, delimiter: str) -> list[str]:
@@ -380,8 +417,19 @@ def parse_table_keys(table_lines: list[str]) -> dict[str, list[str]]:
     return result
 
 
+def is_skipped_top_level_key(key: str) -> bool:
+    lowered = key.lower()
+    if key in SKIP_TOP_LEVEL_KEYS or key in REMOVE_TOP_LEVEL_KEYS:
+        return True
+    if any(lowered.startswith(prefix) for prefix in SKIP_TOP_LEVEL_PREFIXES):
+        return True
+    return any(marker in lowered for marker in SENSITIVE_TOP_LEVEL_MARKERS)
+
+
 def is_skipped_table(name: str) -> bool:
     if name in SKIP_TABLE_NAMES:
+        return True
+    if name.startswith("mcp_servers.") and (name.endswith(".env") or ".env." in name):
         return True
     for prefix in SKIP_TABLE_PREFIXES:
         if name == prefix or name == prefix.rstrip("."):
@@ -422,7 +470,7 @@ def extract_public_config(live_text: str) -> str:
     out: list[str] = []
 
     for key, lines in live_top:
-        if key in SKIP_TOP_LEVEL_KEYS or key in REMOVE_TOP_LEVEL_KEYS:
+        if is_skipped_top_level_key(key):
             continue
         out.extend(strip_blank_edges(lines))
 
@@ -510,7 +558,7 @@ def set_top_level_toml_string(text: str, key: str, value: str) -> str:
     replacement = f"{key} = {json.dumps(value)}"
     pattern = re.compile(rf"(?m)^\s*{re.escape(key)}\s*=.*$")
     if pattern.search(top_level):
-        top_level = pattern.sub(replacement, top_level, count=1)
+        top_level = pattern.sub(lambda _match: replacement, top_level, count=1)
     else:
         model_line = re.search(r"(?m)^\s*model\s*=.*$", top_level)
         if not model_line:
@@ -520,20 +568,133 @@ def set_top_level_toml_string(text: str, key: str, value: str) -> str:
     return top_level + tables
 
 
+def catalog_model_reasoning(path: Path, model: str) -> tuple[set[str], str | None] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return None
+    for entry in models:
+        if not isinstance(entry, dict) or entry.get("slug") != model:
+            continue
+        if not isinstance(entry.get("display_name"), str) or not entry.get("display_name", "").strip():
+            return None
+        levels = entry.get("supported_reasoning_levels") or entry.get("supported_reasoning_efforts")
+        if not isinstance(levels, list) or not levels:
+            return None
+        efforts: set[str] = set()
+        for level in levels:
+            effort = level.get("effort") if isinstance(level, dict) else level
+            if isinstance(effort, str) and effort in REASONING_LEVEL_ORDER:
+                efforts.add(effort)
+        if not efforts:
+            return None
+        default = entry.get("default_reasoning_level")
+        if not isinstance(default, str) or default not in efforts:
+            default = None
+        return efforts, default
+    return None
+
+
+def catalog_model_efforts(path: Path, model: str) -> set[str] | None:
+    result = catalog_model_reasoning(path, model)
+    return result[0] if result else None
+
+
+def configured_catalog_reasoning(text: str, model: str) -> tuple[set[str], str | None] | None:
+    catalog = top_level_toml_value(text, "model_catalog_json")
+    return catalog_model_reasoning(Path(catalog), model) if catalog else None
+
+
+def highest_reasoning_effort(efforts: set[str]) -> str:
+    return max(efforts, key=lambda value: REASONING_LEVEL_ORDER.index(value))
+
+
 def normalize_model_reasoning_effort(text: str) -> tuple[str, list[str]]:
     model = top_level_toml_value(text, "model")
     current = top_level_toml_value(text, "model_reasoning_effort")
-    if model in {"gpt-5.6-sol", "gpt-5.6-terra"}:
-        desired = "ultra"
-    elif model == "grok-4.5" and current not in {"low", "medium", "high"}:
-        desired = "high"
+    policy = REASONING_POLICIES.get(model)
+    catalog_reasoning = configured_catalog_reasoning(text, model) if model else None
+    if policy:
+        allowed, desired = policy
+        if current in allowed:
+            return text, []
+    elif catalog_reasoning:
+        allowed, catalog_default = catalog_reasoning
+        desired = catalog_default or highest_reasoning_effort(allowed)
     else:
         return text, []
-    if current == desired:
+
+    if catalog_reasoning and not policy:
+        catalog_allowed, catalog_default = catalog_reasoning
+        shared_allowed = allowed & catalog_allowed
+        allowed = shared_allowed or catalog_allowed
+        if desired not in allowed:
+            desired = catalog_default if catalog_default in allowed else highest_reasoning_effort(allowed)
+    if current in allowed:
         return text, []
     updated = set_top_level_toml_string(text, "model_reasoning_effort", desired)
     parse_toml(updated, f"model-specific config for {model}")
-    return updated, [f"~ model_reasoning_effort ({model}: {desired})"]
+    old = current or "missing"
+    return updated, [f"~ model_reasoning_effort ({model}: {old} -> {desired})"]
+
+
+def find_best_model_catalog(model: str) -> Path | None:
+    candidates: list[tuple[int, int, float, Path]] = []
+    expected = REASONING_POLICIES.get(model, (set(), ""))[0]
+    for path in CODEX_HOME.glob("*.json"):
+        if not any(pattern.fullmatch(path.name) for pattern in TRUSTED_CATALOG_NAME_PATTERNS):
+            continue
+        efforts = catalog_model_efforts(path, model)
+        if efforts is None:
+            continue
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            modified = 0.0
+        candidates.append((len(efforts & expected), len(efforts), modified, path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return candidates[0][3]
+
+
+def is_trusted_catalog_path(path: Path) -> bool:
+    return any(pattern.fullmatch(path.name) for pattern in TRUSTED_CATALOG_NAME_PATTERNS)
+
+
+def catalog_score(model: str, efforts: set[str] | None) -> tuple[int, int]:
+    if not efforts:
+        return (0, 0)
+    expected = REASONING_POLICIES.get(model, (set(), ""))[0]
+    return (len(efforts & expected), len(efforts))
+
+
+def repair_model_catalog_reference(text: str) -> tuple[str, list[str]]:
+    model = top_level_toml_value(text, "model")
+    if not model:
+        return text, []
+    current = top_level_toml_value(text, "model_catalog_json")
+    current_path = Path(current) if current else None
+    current_efforts = (
+        catalog_model_efforts(current_path, model)
+        if current_path and is_trusted_catalog_path(current_path)
+        else None
+    )
+    if current_efforts and model not in REASONING_POLICIES:
+        return text, []
+    best = find_best_model_catalog(model)
+    if best is None:
+        return text, []
+    best_efforts = catalog_model_efforts(best, model)
+    if current_efforts and catalog_score(model, current_efforts) >= catalog_score(model, best_efforts):
+        return text, []
+    updated = set_top_level_toml_string(text, "model_catalog_json", str(best))
+    parse_toml(updated, f"model catalog config for {model}")
+    old = current or "missing"
+    return updated, [f"~ model_catalog_json ({model}: {old} -> {best})"]
 
 
 def merge_public(target_text: str, source_text: str) -> tuple[str, list[str]]:
@@ -541,8 +702,8 @@ def merge_public(target_text: str, source_text: str) -> tuple[str, list[str]]:
     source_top, source_tables = parse_into_blocks(source_text)
     changes = [] if toml_semantically_equal(extract_public_config(target_text), source_text) else ["~ public mirror"]
 
-    new_top = [(key, lines) for key, lines in target_top if key in SKIP_TOP_LEVEL_KEYS]
-    new_top.extend((key, lines) for key, lines in source_top if key not in SKIP_TOP_LEVEL_KEYS)
+    new_top = [(key, lines) for key, lines in target_top if is_skipped_top_level_key(key)]
+    new_top.extend((key, lines) for key, lines in source_top if not is_skipped_top_level_key(key))
 
     new_tables = [(name, lines) for name, lines in source_tables if not is_skipped_table(name)]
     new_tables.extend((name, lines) for name, lines in target_tables if is_skipped_table(name))
@@ -560,7 +721,12 @@ def merge_public(target_text: str, source_text: str) -> tuple[str, list[str]]:
 
 
 def is_local_shared_table(name: str) -> bool:
-    return name == "projects" or name.startswith("projects.")
+    return (
+        name == "projects"
+        or name.startswith("projects.")
+        or name == "hooks.state"
+        or name.startswith("hooks.state.")
+    )
 
 
 def render_tables(tables: list[tuple[str, list[str]]]) -> str:
@@ -575,8 +741,6 @@ def render_tables(tables: list[tuple[str, list[str]]]) -> str:
 def merge_local_shared_tables(target_text: str, source_text: str) -> tuple[str, list[str]]:
     source_top, source_tables = parse_into_blocks(source_text)
     source_local = [(name, lines) for name, lines in source_tables if is_local_shared_table(name)]
-    if not source_local:
-        return target_text, []
 
     target_top, target_tables = parse_into_blocks(target_text)
     target_local = [(name, lines) for name, lines in target_tables if is_local_shared_table(name)]
@@ -594,7 +758,21 @@ def merge_local_shared_tables(target_text: str, source_text: str) -> tuple[str, 
         out.extend(strip_blank_edges(lines))
         if idx < len(new_tables) - 1:
             out.append("")
-    return normalize_text(out), ["~ local shared tables (projects)"]
+    return normalize_text(out), ["~ local shared tables"]
+
+
+def merge_live_state_for_restart(target_text: str, live_text: str) -> tuple[str, list[str]]:
+    # The proxy backup owns provider/model routing. Only refresh provider-neutral
+    # settings and local trust state from live; live may contain takeover values.
+    source_public = extract_public_config(live_text)
+    retry_settings, _retry_source = extract_model_provider_retry_settings(live_text)
+    updated, public_changes = merge_public(target_text, source_public)
+    updated, local_changes = merge_local_shared_tables(updated, live_text)
+    updated, retry_changes = merge_model_provider_retry_settings(updated, retry_settings)
+    changes = public_changes + local_changes + retry_changes
+    if updated != target_text:
+        parse_toml(updated, "CC-Switch restart-preserved config")
+    return updated, changes
 
 
 def is_windows_admin() -> bool:
@@ -958,6 +1136,37 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
         conn.execute("INSERT INTO settings(key, value) VALUES(?, ?)", (key, value))
 
 
+def codex_state_fingerprint(conn: sqlite3.Connection) -> str:
+    payload = {
+        "settings": [
+            list(row)
+            for row in conn.execute(
+                "SELECT key, value FROM settings WHERE key IN (?, ?) ORDER BY key",
+                (SETTING_COMMON, SETTING_CANONICAL),
+            )
+        ],
+        "providers": [
+            list(row)
+            for row in conn.execute(
+                """
+                SELECT id, settings_config, meta
+                FROM providers
+                WHERE app_type = 'codex'
+                ORDER BY id
+                """
+            )
+        ],
+        "proxy": [
+            list(row)
+            for row in conn.execute(
+                "SELECT app_type, original_config FROM proxy_live_backup WHERE app_type = 'codex'"
+            )
+        ],
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def read_json_object(text: str | None, label: str) -> dict[str, Any]:
     if not text:
         return {}
@@ -973,10 +1182,10 @@ def read_json_object(text: str | None, label: str) -> dict[str, Any]:
 
 
 def embedded_public_config() -> str:
-    return EMBEDDED_PUBLIC_CONFIG.replace(r"C:\Users\Wes", str(HOME))
+    return EMBEDDED_PUBLIC_CONFIG.replace("{{HOME}}", str(HOME))
 
 
-def backup_before_write(label: str) -> Path:
+def backup_before_write(label: str, include_auth: bool = False) -> Path:
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     target = BACKUP_ROOT / f"codex-ccswitch-{label}-{stamp}"
     target.mkdir(parents=True, exist_ok=True)
@@ -993,12 +1202,54 @@ def backup_before_write(label: str) -> Path:
     for src_path, name in [
         (CCSWITCH_SETTINGS, "cc-switch.settings.json.bak"),
         (LIVE_CONFIG, "config.toml.live"),
-        (AUTH_JSON, "auth.json.bak"),
         (GLOBAL_STATE, ".codex-global-state.json.bak"),
     ]:
         if src_path.exists():
             shutil.copy2(src_path, target / name)
+    if include_auth and AUTH_JSON.exists():
+        shutil.copy2(AUTH_JSON, target / "auth.json.bak")
+    manifest = {
+        "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "label": label,
+        "includes_auth_file": include_auth and AUTH_JSON.exists(),
+        "includes_cc_switch_db": CCSWITCH_DB.exists(),
+    }
+    write_text(target / "manifest.json", json.dumps(manifest, indent=2) + "\n")
     return target
+
+
+def rollback_from_backup(backup_dir: Path, destination_conn: sqlite3.Connection | None = None) -> None:
+    warn(f"Rolling back from backup: {backup_dir}")
+    db_backup = backup_dir / "cc-switch.db.bak"
+    if db_backup.exists():
+        source = sqlite3.connect(db_backup, timeout=15)
+        destination = destination_conn or sqlite3.connect(CCSWITCH_DB, timeout=15)
+        try:
+            destination.rollback()
+            source.backup(destination)
+            destination.commit()
+        finally:
+            if destination_conn is None:
+                destination.close()
+            source.close()
+    for backup_name, destination in (
+        ("config.toml.live", LIVE_CONFIG),
+        ("auth.json.bak", AUTH_JSON),
+        ("cc-switch.settings.json.bak", CCSWITCH_SETTINGS),
+        (".codex-global-state.json.bak", GLOBAL_STATE),
+    ):
+        backup_path = backup_dir / backup_name
+        if backup_path.exists():
+            write_text(destination, read_text(backup_path))
+
+
+def attempt_rollback(backup_dir: Path, destination_conn: sqlite3.Connection | None = None) -> bool:
+    try:
+        rollback_from_backup(backup_dir, destination_conn=destination_conn)
+        return True
+    except BaseException as exc:
+        error(f"Rollback failed; preserve the backup directory for manual recovery: {exc}")
+        return False
 
 
 def toml_quote(value: str) -> str:
@@ -1080,7 +1331,14 @@ def toml_value_from_line(text: str, key: str) -> str:
         return ""
     value = match.group(1).strip()
     quote = value[:1]
-    if quote in {"'", '"'}:
+    if quote == '"':
+        try:
+            decoded, _end = json.JSONDecoder().raw_decode(value)
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, str):
+            return normalize_path_text(decoded)
+    if quote == "'":
         end = value.find(quote, 1)
         if end >= 0:
             return normalize_path_text(value[1:end])
@@ -1207,15 +1465,28 @@ def repair_chrome_latest(dry_run: bool = False) -> list[str]:
     changes = [f"~ chrome latest -> {target}"]
     if dry_run:
         return changes
-    if latest.exists():
-        latest_resolved = latest.resolve()
-        cache_resolved = CHROME_PLUGIN_CACHE.resolve()
-        if not str(latest_resolved).lower().startswith(str(cache_resolved).lower()):
-            fatal(f"Refusing to remove chrome latest outside cache: {latest_resolved}")
-        os.rmdir(latest)
+    if os.path.lexists(latest):
+        try:
+            attributes = os.lstat(latest).st_file_attributes
+        except (AttributeError, OSError) as exc:
+            fatal(f"Could not inspect chrome latest before replacement: {exc}")
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if not attributes & reparse_flag:
+            fatal(f"Refusing to replace chrome latest because it is not a junction/symlink: {latest}")
+        if latest.parent.resolve() != CHROME_PLUGIN_CACHE.resolve() or latest.name != "latest":
+            fatal(f"Refusing to remove chrome latest outside the expected cache entry: {latest}")
+        remove_result = subprocess.run(
+            ["cmd", "/c", "rmdir", str(latest)],
+            capture_output=True,
+            text=True,
+        )
+        if remove_result.returncode != 0 or os.path.lexists(latest):
+            fatal((remove_result.stderr or remove_result.stdout or "rmdir junction failed").strip())
     result = subprocess.run(["cmd", "/c", "mklink", "/J", str(latest), str(target)], capture_output=True, text=True)
     if result.returncode != 0:
         fatal((result.stderr or result.stdout or "mklink failed").strip())
+    if not (latest / "scripts" / "browser-client.mjs").exists():
+        fatal("Chrome latest junction was created but browser-client.mjs is still unavailable")
     return changes
 
 
@@ -1295,6 +1566,8 @@ def repair_runtime(dry_run: bool = False) -> int:
     conn = connect_db()
     provider_updates: list[tuple[str, str, str, list[str]]] = []
     proxy_update = None
+    proxy_changes: list[str] = []
+    planned_state = ""
     try:
         for row in conn.execute("SELECT id, name, settings_config FROM providers WHERE app_type='codex'"):
             settings_config = read_json_object(row["settings_config"], f"provider:{row['id']}:settings_config")
@@ -1317,19 +1590,25 @@ def repair_runtime(dry_run: bool = False) -> int:
         if row:
             original_config = read_json_object(row["original_config"], "proxy_live_backup:codex")
             config = original_config.get("config") if isinstance(original_config.get("config"), str) else ""
-            repaired, changed = replace_node_repl_bundle(config, new_bundle)
-            changed = changed and not toml_semantically_equal(config, repaired)
-            if changed:
+            preserved, _preserve_details = merge_live_state_for_restart(config, live_new)
+            if not toml_semantically_equal(config, preserved):
+                proxy_changes.append("~ public/local restart snapshot")
+            repaired, runtime_changed = replace_node_repl_bundle(preserved, new_bundle)
+            runtime_changed = runtime_changed and not toml_semantically_equal(preserved, repaired)
+            if runtime_changed:
+                proxy_changes.append("~ [mcp_servers.node_repl]")
+            if not toml_semantically_equal(config, repaired):
                 parse_toml(repaired, "proxy_live_backup codex config")
                 original_config["config"] = repaired
                 proxy_update = json.dumps(original_config, ensure_ascii=False, separators=(",", ":"))
+        planned_state = codex_state_fingerprint(conn)
     finally:
         conn.close()
 
     for _provider_id, provider_name, _settings, provider_changes in provider_updates:
         summarize_changes(f"provider {provider_name}", provider_changes)
     if proxy_update is not None:
-        summarize_changes("proxy_live_backup codex", ["~ [mcp_servers.node_repl]"])
+        summarize_changes("proxy_live_backup codex", proxy_changes)
     summarize_changes("runtime", changes)
 
     has_changes = bool(changes or provider_updates or proxy_update is not None)
@@ -1340,29 +1619,62 @@ def repair_runtime(dry_run: bool = False) -> int:
         info("Dry-run only; runtime paths were not written.")
         return 0
 
-    backup_dir = backup_before_write("repair-runtime")
-    info(f"Backup: {backup_dir}")
-    if live_changed:
-        write_text(LIVE_CONFIG, live_new)
-    repair_chrome_latest(dry_run=False)
-    repair_edge_native_host(dry_run=False)
-    conn = connect_db()
+    restart_paths = stop_cc_switch_for_write()
+    backup_dir: Path | None = None
+    core_applied = False
     try:
-        for provider_id, _provider_name, settings, _changes in provider_updates:
-            conn.execute(
-                "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = 'codex'",
-                (settings, provider_id),
-            )
-        if proxy_update is not None:
-            conn.execute(
-                "UPDATE proxy_live_backup SET original_config = ?, backed_up_at = ? WHERE app_type = 'codex'",
-                (proxy_update, _dt.datetime.now(_dt.timezone.utc).isoformat()),
-            )
-        conn.commit()
+        backup_dir = backup_before_write("repair-runtime")
+        info(f"Backup: {backup_dir}")
+        conn = connect_db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current_live = read_text(LIVE_CONFIG) if LIVE_CONFIG.exists() else ""
+            if current_live != live_text or codex_state_fingerprint(conn) != planned_state:
+                fatal(
+                    "Codex/CC-Switch state changed while stopping CC-Switch; "
+                    "refusing to apply a stale runtime repair plan. Run the command again."
+                )
+            if live_changed:
+                write_text(LIVE_CONFIG, live_new)
+            for provider_id, _provider_name, settings, _changes in provider_updates:
+                conn.execute(
+                    "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = 'codex'",
+                    (settings, provider_id),
+                )
+            if proxy_update is not None:
+                conn.execute(
+                    "UPDATE proxy_live_backup SET original_config = ?, backed_up_at = ? WHERE app_type = 'codex'",
+                    (proxy_update, _dt.datetime.now(_dt.timezone.utc).isoformat()),
+                )
+            parse_toml(read_text(LIVE_CONFIG), "verified runtime-repaired live config")
+            conn.commit()
+        finally:
+            conn.close()
+        core_applied = True
+        repair_chrome_latest(dry_run=False)
+        repair_edge_native_host(dry_run=False)
+    except BaseException:
+        if backup_dir is not None and not core_applied:
+            attempt_rollback(backup_dir)
+        elif core_applied:
+            warn("Core runtime config is committed; an external browser/native-host repair failed and was left for retry.")
+        raise
     finally:
-        conn.close()
+        restart_cc_switch(restart_paths)
     info("Runtime repair complete.")
     return 0
+
+
+def public_config_looks_complete(public_text: str) -> bool:
+    return all(
+        marker in public_text
+        for marker in (
+            "approval_policy",
+            "sandbox_mode",
+            "[desktop]",
+            "[features]",
+        )
+    )
 
 
 def choose_public_source(conn: sqlite3.Connection, source: str) -> tuple[str, str]:
@@ -1373,25 +1685,20 @@ def choose_public_source(conn: sqlite3.Connection, source: str) -> tuple[str, st
         if not LIVE_CONFIG.exists():
             fatal(f"Live config not found: {LIVE_CONFIG}")
         text = extract_public_config(read_text(LIVE_CONFIG))
+        if not public_config_looks_complete(text):
+            fatal(
+                "Live public config is incomplete; refusing to publish it over all CC-Switch providers. "
+                "Restore the expected approval, sandbox, desktop, and features sections first."
+            )
         return text, "current live config"
 
     if LIVE_CONFIG.exists():
         live_text = read_text(LIVE_CONFIG)
-        live_looks_healthy = all(
-            marker in live_text
-            for marker in (
-                'approval_policy = "never"',
-                'sandbox_mode = "danger-full-access"',
-                "[memories]",
-                'followUpQueueMode = "steer"',
-                '[plugins."browser@openai-bundled"]',
-                '[plugins."chrome@openai-bundled"]',
-                '[plugins."computer-use@openai-bundled"]',
-                '[plugins."ponytail@ponytail"]',
-            )
-        )
-        if live_looks_healthy:
-            return extract_public_config(live_text), "current healthy live config"
+        public_text = extract_public_config(live_text)
+        live_looks_complete = public_config_looks_complete(public_text)
+        if public_text.strip() and live_looks_complete:
+            parse_toml(live_text, "current live config")
+            return public_text, "current valid live config"
 
     canonical = get_setting(conn, SETTING_CANONICAL)
     if canonical.strip():
@@ -1433,6 +1740,7 @@ def collect_template_repairs(
         new_config, merge_changes = merge_public(old_config, source_text)
         new_config, local_changes = merge_local_shared_tables(new_config, local_shared_text)
         new_config, retry_changes = merge_model_provider_retry_settings(new_config, retry_settings)
+        new_config, catalog_changes = repair_model_catalog_reference(new_config)
         new_config, reasoning_changes = normalize_model_reasoning_effort(new_config)
         if new_config != old_config:
             parse_toml(new_config, f"provider {row['name']} ({row['id']}) config")
@@ -1441,6 +1749,7 @@ def collect_template_repairs(
             changes.extend(local_changes)
             changes.extend(retry_changes)
             changes.extend(reasoning_changes)
+            changes.extend(catalog_changes)
 
         if meta.get("commonConfigEnabled") is not True:
             meta["commonConfigEnabled"] = True
@@ -1466,10 +1775,12 @@ def collect_template_repairs(
         new_config, changes = merge_public(old_config, source_text)
         new_config, local_changes = merge_local_shared_tables(new_config, local_shared_text)
         new_config, retry_changes = merge_model_provider_retry_settings(new_config, retry_settings)
+        new_config, catalog_changes = repair_model_catalog_reference(new_config)
         new_config, reasoning_changes = normalize_model_reasoning_effort(new_config)
         changes.extend(local_changes)
         changes.extend(retry_changes)
         changes.extend(reasoning_changes)
+        changes.extend(catalog_changes)
         if new_config != old_config:
             parse_toml(new_config, "proxy_live_backup codex config")
             original_config["config"] = new_config
@@ -1504,9 +1815,11 @@ def sync_public_config(source: str, dry_run: bool = False) -> int:
         retry_settings, retry_source_label = extract_model_provider_retry_settings(live_text)
         live_new, live_changes = merge_public(live_text, source_text)
         live_new, live_retry_changes = merge_model_provider_retry_settings(live_new, retry_settings)
+        live_new, live_catalog_changes = repair_model_catalog_reference(live_new)
         live_new, live_reasoning_changes = normalize_model_reasoning_effort(live_new)
         live_changes.extend(live_retry_changes)
         live_changes.extend(live_reasoning_changes)
+        live_changes.extend(live_catalog_changes)
         parse_toml(live_new, "merged live config")
 
         common_old = get_setting(conn, SETTING_COMMON)
@@ -1519,6 +1832,7 @@ def sync_public_config(source: str, dry_run: bool = False) -> int:
             live_text,
             retry_settings,
         )
+        planned_state = codex_state_fingerprint(conn)
 
         info(f"Public config source: {source_label}")
         if retry_settings:
@@ -1561,10 +1875,18 @@ def sync_public_config(source: str, dry_run: bool = False) -> int:
             return 0
 
         restart_paths = stop_cc_switch_for_write()
+        backup_dir: Path | None = None
         try:
             backup_dir = backup_before_write("sync")
             info(f"Backup: {backup_dir}")
 
+            conn.execute("BEGIN IMMEDIATE")
+            current_live = read_text(LIVE_CONFIG) if LIVE_CONFIG.exists() else ""
+            if current_live != live_text or codex_state_fingerprint(conn) != planned_state:
+                fatal(
+                    "Codex/CC-Switch state changed while stopping CC-Switch; "
+                    "refusing to apply a stale public-config plan. Run the command again."
+                )
             set_setting(conn, SETTING_COMMON, source_text)
             set_setting(conn, SETTING_CANONICAL, source_text)
             for provider_id, _provider_name, settings_config, meta, _changes in provider_updates:
@@ -1581,8 +1903,14 @@ def sync_public_config(source: str, dry_run: bool = False) -> int:
                     "UPDATE proxy_live_backup SET original_config = ? WHERE app_type = 'codex'",
                     (proxy_backup_update[0],),
                 )
+            if live_changes:
+                write_text(LIVE_CONFIG, live_new)
+                parse_toml(read_text(LIVE_CONFIG), "verified synchronized live config")
             conn.commit()
-            write_text(LIVE_CONFIG, live_new)
+        except BaseException:
+            if backup_dir is not None:
+                attempt_rollback(backup_dir, destination_conn=conn)
+            raise
         finally:
             restart_cc_switch(restart_paths)
         info("Public config repaired in live config, common config, provider templates, and proxy backup.")
@@ -1591,14 +1919,14 @@ def sync_public_config(source: str, dry_run: bool = False) -> int:
         conn.close()
 
 
-TOKEN_MARKERS = ("access_token", "refresh_token", "id_token", "account_id", "chatgpt", "tokens")
+TOKEN_MARKERS = ("access_token", "refresh_token", "id_token")
 
 
 def contains_token_shape(value: Any) -> bool:
     if isinstance(value, dict):
         for key, child in value.items():
             lowered = str(key).lower()
-            if any(marker in lowered for marker in TOKEN_MARKERS):
+            if any(marker in lowered for marker in TOKEN_MARKERS) and isinstance(child, str) and bool(child.strip()):
                 return True
             if contains_token_shape(child):
                 return True
@@ -1623,7 +1951,8 @@ def classify_auth_json(data: dict[str, Any]) -> str:
     if not data:
         return "missing"
     has_official = contains_token_shape(data)
-    has_api_key = "OPENAI_API_KEY" in data
+    api_key = data.get("OPENAI_API_KEY")
+    has_api_key = isinstance(api_key, str) and bool(api_key.strip())
     if has_official and has_api_key:
         return "official+api_key"
     if has_official:
@@ -1653,6 +1982,117 @@ def classify_auth_text(text: str) -> str:
     return classify_auth_json(value)
 
 
+def parse_auth_timestamp(value: Any) -> _dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = _dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed.astimezone(_dt.timezone.utc)
+
+
+def auth_last_refresh(data: dict[str, Any]) -> _dt.datetime | None:
+    return parse_auth_timestamp(data.get("last_refresh"))
+
+
+def jwt_expiry(data: dict[str, Any]) -> _dt.datetime | None:
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    token = tokens.get("access_token")
+    if not isinstance(token, str):
+        return None
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        expiry = decoded.get("exp") if isinstance(decoded, dict) else None
+        if not isinstance(expiry, (int, float)):
+            return None
+        return _dt.datetime.fromtimestamp(expiry, tz=_dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def auth_access_token_expired(data: dict[str, Any]) -> bool | None:
+    expiry = jwt_expiry(data)
+    if expiry is None:
+        return None
+    return expiry <= _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=5)
+
+
+def normalized_official_auth_object(data: dict[str, Any]) -> dict[str, Any] | None:
+    normalized = json.loads(json.dumps(data))
+    normalized.pop("OPENAI_API_KEY", None)
+    return normalized if classify_auth_json(normalized) == "official" else None
+
+
+def official_auth_reference_matches(data: dict[str, Any], expected: dict[str, Any]) -> bool:
+    return classify_auth_json(data) == "official" and normalized_official_auth_object(data) == expected
+
+
+def auth_fingerprint(data: dict[str, Any]) -> str:
+    normalized = normalized_official_auth_object(data)
+    if normalized is None:
+        return "n/a"
+    payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def format_auth_refresh(data: dict[str, Any]) -> str:
+    refreshed = auth_last_refresh(data)
+    return refreshed.isoformat() if refreshed else "unknown"
+
+
+def compare_auth_recency(live: dict[str, Any], backup: dict[str, Any]) -> int | None:
+    live_normalized = normalized_official_auth_object(live)
+    backup_normalized = normalized_official_auth_object(backup)
+    if live_normalized is None or backup_normalized is None:
+        return None
+    if live_normalized == backup_normalized:
+        return 0
+
+    live_refresh = auth_last_refresh(live_normalized)
+    backup_refresh = auth_last_refresh(backup_normalized)
+    if live_refresh and backup_refresh:
+        return 1 if live_refresh > backup_refresh else -1 if live_refresh < backup_refresh else 0
+
+    live_expiry = jwt_expiry(live_normalized)
+    backup_expiry = jwt_expiry(backup_normalized)
+    if live_expiry and backup_expiry:
+        return 1 if live_expiry > backup_expiry else -1 if live_expiry < backup_expiry else 0
+    return None
+
+
+def enforce_capture_freshness(live: dict[str, Any], backup_text: str, force: bool = False) -> None:
+    if force or classify_auth_text(backup_text) not in ("official", "official+api_key"):
+        return
+    backup = json.loads(normalize_official_auth_text(backup_text))
+    live_normalized = normalized_official_auth_object(live)
+    if live_normalized == backup:
+        return
+
+    comparison = compare_auth_recency(live, backup)
+    if comparison == 1:
+        return
+    if comparison == -1:
+        reason = "the DB backup has a newer refresh time"
+    elif comparison == 0:
+        reason = "the refresh times match but the credentials differ"
+    else:
+        reason = "credential freshness cannot be proven"
+    fatal(
+        "Refusing to capture live auth because "
+        + reason
+        + ". This protects a newer or ambiguous DB credential from being overwritten. "
+        "Use capture-auth-force only after confirming the live ChatGPT account is the one to keep."
+    )
+
+
 def strip_api_key_from_official_auth_text(text: str) -> str:
     data = json.loads(text)
     if not isinstance(data, dict):
@@ -1674,13 +2114,23 @@ def repair_official_auth_references(
     conn: sqlite3.Connection,
     official_text: str,
     dry_run: bool = False,
+    preserve_live_config: bool = False,
 ) -> list[str]:
     normalized_text = normalize_official_auth_text(official_text)
     official_auth = json.loads(normalized_text)
     changes: list[str] = []
 
     old_setting = get_setting(conn, SETTING_OFFICIAL_AUTH)
-    if old_setting != normalized_text:
+    try:
+        old_setting_value = json.loads(old_setting) if old_setting.strip() else {}
+    except json.JSONDecodeError:
+        old_setting_value = {}
+    old_setting_matches = (
+        official_auth_reference_matches(old_setting_value, official_auth)
+        if isinstance(old_setting_value, dict)
+        else False
+    )
+    if not old_setting_matches:
         changes.append(f"~ DB setting {SETTING_OFFICIAL_AUTH}")
         if not dry_run:
             set_setting(conn, SETTING_OFFICIAL_AUTH, normalized_text)
@@ -1698,7 +2148,7 @@ def repair_official_auth_references(
             "provider:codex-official:settings_config",
         )
         old_auth = settings_config.get("auth") if isinstance(settings_config.get("auth"), dict) else {}
-        if old_auth != official_auth:
+        if not official_auth_reference_matches(old_auth, official_auth):
             changes.append("~ provider codex-official auth")
             if not dry_run:
                 settings_config["auth"] = official_auth
@@ -1744,21 +2194,31 @@ def repair_official_auth_references(
     if row:
         original_config = read_json_object(row["original_config"], "proxy_live_backup:codex")
         old_auth = original_config.get("auth") if isinstance(original_config.get("auth"), dict) else {}
-        if old_auth != official_auth:
+        proxy_changed = False
+        if not official_auth_reference_matches(old_auth, official_auth):
             changes.append("~ proxy_live_backup codex auth")
-            if not dry_run:
-                original_config["auth"] = official_auth
-                conn.execute(
-                    """
-                    UPDATE proxy_live_backup
-                    SET original_config = ?, backed_up_at = ?
-                    WHERE app_type = 'codex'
-                    """,
-                    (
-                        json.dumps(original_config, ensure_ascii=False, separators=(",", ":")),
-                        _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                    ),
-                )
+            original_config["auth"] = official_auth
+            proxy_changed = True
+        if preserve_live_config and LIVE_CONFIG.exists():
+            old_config = original_config.get("config") if isinstance(original_config.get("config"), str) else ""
+            live_text = read_text(LIVE_CONFIG)
+            preserved_config, _preserve_changes = merge_live_state_for_restart(old_config, live_text)
+            if not toml_semantically_equal(old_config, preserved_config):
+                changes.append("~ proxy_live_backup codex public/local config")
+                original_config["config"] = preserved_config
+                proxy_changed = True
+        if proxy_changed and not dry_run:
+            conn.execute(
+                """
+                UPDATE proxy_live_backup
+                SET original_config = ?, backed_up_at = ?
+                WHERE app_type = 'codex'
+                """,
+                (
+                    json.dumps(original_config, ensure_ascii=False, separators=(",", ":")),
+                    _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                ),
+            )
     else:
         changes.append("+ proxy_live_backup codex")
         if not dry_run:
@@ -1813,12 +2273,19 @@ def run_codex_login_status() -> str:
             timeout=10,
         )
         output = (result.stdout or result.stderr or "").strip()
-        return output or f"codex login status exited with {result.returncode}"
+        if result.returncode == 0:
+            lowered = output.lower()
+            if "chatgpt" in lowered:
+                return "Logged in using ChatGPT"
+            if "api key" in lowered or "api_key" in lowered:
+                return "Logged in using an API key"
+            return "Logged in (account details withheld)"
+        return f"codex login status exited with {result.returncode}"
     except Exception as exc:
         return f"could not run codex login status: {exc}"
 
 
-def capture_official_auth(dry_run: bool = False) -> int:
+def capture_official_auth(dry_run: bool = False, force: bool = False) -> int:
     data = read_auth_file()
     mode = classify_auth_json(data)
     if mode not in ("official", "official+api_key"):
@@ -1832,7 +2299,13 @@ def capture_official_auth(dry_run: bool = False) -> int:
     try:
         old_text = get_setting(conn, SETTING_OFFICIAL_AUTH)
         old_mode = classify_auth_text(old_text)
-        changes = repair_official_auth_references(conn, text, dry_run=True)
+        enforce_capture_freshness(data, old_text, force=force)
+        changes = repair_official_auth_references(
+            conn,
+            text,
+            dry_run=True,
+            preserve_live_config=True,
+        )
         info(f"Live auth: {describe_auth_file()}")
         info(f"DB official auth backup: {old_mode}")
         if not changes:
@@ -1842,21 +2315,44 @@ def capture_official_auth(dry_run: bool = False) -> int:
             summarize_changes("official auth references", changes)
             info("Dry-run only; no auth backup was written.")
             return 0
-        if cc_switch_pids():
-            info("cc-switch.exe is running; auth-only capture will write DB backup without restarting it.")
-        backup_dir = backup_before_write("capture-auth")
-        info(f"Backup: {backup_dir}")
-        changes = repair_official_auth_references(conn, text)
-        conn.commit()
-        summarize_changes("official auth references", changes)
-        verify_official_auth_references(text)
-        info("Captured official auth into DB and CC-Switch official restore references.")
-        return 0
     finally:
         conn.close()
 
+    restart_paths = stop_cc_switch_for_write()
+    backup_dir: Path | None = None
+    try:
+        data = read_auth_file()
+        mode = classify_auth_json(data)
+        if mode not in ("official", "official+api_key"):
+            fatal(f"Live auth changed while stopping CC-Switch (detected: {mode}); refusing to capture.")
+        text = normalize_official_auth_text(AUTH_JSON.read_text(encoding="utf-8"))
+        conn = connect_db()
+        try:
+            enforce_capture_freshness(data, get_setting(conn, SETTING_OFFICIAL_AUTH), force=force)
+        finally:
+            conn.close()
+        backup_dir = backup_before_write("capture-auth", include_auth=True)
+        info(f"Backup: {backup_dir}")
+        conn = connect_db()
+        try:
+            changes = repair_official_auth_references(conn, text, preserve_live_config=True)
+            conn.commit()
+        finally:
+            conn.close()
+        summarize_changes("official auth references", changes)
+        if not verify_official_auth_references(text):
+            raise RuntimeError("Official auth verification failed after capture.")
+        info("Captured current official auth into all CC-Switch restore references.")
+        return 0
+    except BaseException:
+        if backup_dir is not None:
+            attempt_rollback(backup_dir)
+        raise
+    finally:
+        restart_cc_switch(restart_paths)
 
-def restore_official_auth(dry_run: bool = False) -> int:
+
+def restore_official_auth(dry_run: bool = False, force: bool = False) -> int:
     conn = connect_db()
     try:
         backup_text = get_setting(conn, SETTING_OFFICIAL_AUTH)
@@ -1864,7 +2360,8 @@ def restore_official_auth(dry_run: bool = False) -> int:
         conn.close()
 
     backup_mode = classify_auth_text(backup_text)
-    live_mode = classify_auth_json(read_auth_file())
+    live_data = read_auth_file()
+    live_mode = classify_auth_json(live_data)
     official_text = normalize_official_auth_text(backup_text) if backup_mode in ("official", "official+api_key") else ""
     info(f"Live auth: {describe_auth_file()}")
     info(f"DB official auth backup: {backup_mode}")
@@ -1874,13 +2371,33 @@ def restore_official_auth(dry_run: bool = False) -> int:
             "No official ChatGPT auth backup exists in CC-Switch DB yet. "
             "Sign in with ChatGPT until quota/account info appears, then run: codex-ccswitch.bat capture-auth"
         )
+    backup_data = json.loads(official_text)
+    live_matches_backup = False
+    if live_mode in ("official", "official+api_key") and not force:
+        live_normalized = normalized_official_auth_object(live_data)
+        live_matches_backup = live_normalized == backup_data
+        if not live_matches_backup:
+            fatal(
+                "Live auth is already official and differs from the DB backup; refusing to overwrite it. "
+                "Run capture-auth to save the live credential, or restore-auth-force only for deliberate rollback."
+            )
+    live_needs_restore = force or live_mode not in ("official", "official+api_key")
+    expired = auth_access_token_expired(backup_data)
+    if live_needs_restore and expired is True and not force:
+        fatal(
+            "The DB backup access token is expired; refusing automatic rollback. "
+            "Use restore-auth-force only if you intentionally want Codex to attempt refresh with that backup."
+        )
     conn = connect_db()
     try:
-        reference_changes = repair_official_auth_references(conn, official_text, dry_run=True)
+        reference_changes = repair_official_auth_references(
+            conn,
+            official_text,
+            dry_run=True,
+            preserve_live_config=True,
+        )
     finally:
         conn.close()
-    live_needs_restore = live_mode not in ("official", "official+api_key")
-
     if not live_needs_restore and not reference_changes:
         info("Live auth and CC-Switch official restore references are already official; nothing to restore.")
         return 0
@@ -1892,23 +2409,35 @@ def restore_official_auth(dry_run: bool = False) -> int:
         info("Dry-run only; auth.json was not written.")
         return 0
 
-    if cc_switch_pids():
-        info("cc-switch.exe is running; auth-only restore will write auth refs and verify without restarting it.")
-    backup_dir = backup_before_write("restore-auth")
-    info(f"Backup: {backup_dir}")
-    conn = connect_db()
+    restart_paths = stop_cc_switch_for_write()
+    backup_dir: Path | None = None
     try:
-        reference_changes = repair_official_auth_references(conn, official_text)
-        conn.commit()
+        backup_dir = backup_before_write("restore-auth", include_auth=True)
+        info(f"Backup: {backup_dir}")
+        conn = connect_db()
+        try:
+            reference_changes = repair_official_auth_references(
+                conn,
+                official_text,
+                preserve_live_config=True,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if live_needs_restore:
+            write_text(AUTH_JSON, official_text)
+        summarize_changes("official auth references", reference_changes)
+        if live_needs_restore:
+            info("Restored official ChatGPT auth.json from CC-Switch DB backup.")
+        if not verify_official_auth_references(official_text, verify_live=True):
+            raise RuntimeError("Official auth verification failed after restore.")
+        return 0
+    except BaseException:
+        if backup_dir is not None:
+            attempt_rollback(backup_dir)
+        raise
     finally:
-        conn.close()
-    if live_needs_restore:
-        write_text(AUTH_JSON, official_text)
-    summarize_changes("official auth references", reference_changes)
-    if live_needs_restore:
-        info("Restored official ChatGPT auth.json from CC-Switch DB backup.")
-    verify_official_auth_references(official_text, verify_live=True)
-    return 0
+        restart_cc_switch(restart_paths)
 
 
 def get_current_codex_provider_summary(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -1987,14 +2516,39 @@ def auth_summary_from_object(value: Any) -> str:
     return f"{classify_auth_json(auth)} keys={keys}"
 
 
+def describe_auth_drift(live: dict[str, Any], backup_text: str) -> str:
+    try:
+        backup = json.loads(backup_text) if backup_text.strip() else {}
+    except json.JSONDecodeError:
+        return "DB backup is invalid JSON"
+    live_normalized = normalized_official_auth_object(live)
+    backup_normalized = normalized_official_auth_object(backup if isinstance(backup, dict) else {})
+    if live_normalized is None or backup_normalized is None:
+        return "not comparable"
+    if live_normalized == backup_normalized:
+        return "match"
+    live_time = auth_last_refresh(live_normalized)
+    backup_time = auth_last_refresh(backup_normalized)
+    direction = "different"
+    if live_time and backup_time:
+        direction = "live newer" if live_time > backup_time else "DB newer" if backup_time > live_time else "same timestamp, different tokens"
+    return (
+        f"DRIFT ({direction}; live_refresh={format_auth_refresh(live_normalized)}; "
+        f"db_refresh={format_auth_refresh(backup_normalized)}; "
+        f"live_fp={auth_fingerprint(live_normalized)}; db_fp={auth_fingerprint(backup_normalized)})"
+    )
+
+
 def status() -> int:
     print("== Codex auth ==")
+    live_auth = read_auth_file()
     print(f"live auth: {describe_auth_file()}")
     conn = connect_db()
     try:
         official_backup = get_setting(conn, SETTING_OFFICIAL_AUTH)
         backup_mode = classify_auth_text(official_backup)
         print(f"DB official auth backup: {backup_mode}")
+        print(f"live vs DB official auth: {describe_auth_drift(live_auth, official_backup)}")
 
         official_provider = conn.execute(
             "SELECT settings_config FROM providers WHERE id='codex-official' AND app_type='codex'"
@@ -2019,7 +2573,7 @@ def status() -> int:
 
         if backup_mode in ("official", "official+api_key"):
             drift = repair_official_auth_references(conn, official_backup, dry_run=True)
-            print(f"official auth references: {'ok' if not drift else 'needs repair: ' + ', '.join(drift)}")
+            print(f"DB-internal official auth references: {'ok' if not drift else 'needs repair: ' + ', '.join(drift)}")
     finally:
         conn.close()
     print(f"codex login status: {run_codex_login_status()}")
@@ -2070,6 +2624,17 @@ def status() -> int:
         canonical = get_setting(conn, SETTING_CANONICAL)
         print(f"{SETTING_COMMON}: {len(common)} bytes, approval={'approval_policy' in common}, memories={'memories' in common}")
         print(f"{SETTING_CANONICAL}: {len(canonical)} bytes, approval={'approval_policy' in canonical}, memories={'memories' in canonical}")
+        live_public = extract_public_config(live_text) if live_text else ""
+        print(f"live public vs common: {'match' if toml_semantically_equal(live_public, common) else 'DRIFT'}")
+        print(f"live public vs canonical: {'match' if toml_semantically_equal(live_public, canonical) else 'DRIFT'}")
+        model = top_level_toml_value(live_text, "model")
+        effort = top_level_toml_value(live_text, "model_reasoning_effort") or "(default)"
+        catalog = top_level_toml_value(live_text, "model_catalog_json")
+        catalog_efforts = catalog_model_efforts(Path(catalog), model) if catalog and model else None
+        catalog_status = "missing"
+        if catalog:
+            catalog_status = "model present" if catalog_efforts is not None else "model absent or unreadable"
+        print(f"live model policy: model={model or '(default)'}, effort={effort}, catalog={catalog_status}")
         summary = get_current_codex_provider_summary(conn)
         if summary:
             print("current provider:")
@@ -2113,14 +2678,18 @@ def auto_auth(dry_run: bool = False) -> int:
         print("\n== Auth auto-save ==")
         return capture_official_auth(dry_run=dry_run)
     if live_mode not in ("official", "official+api_key") and backup_mode in ("official", "official+api_key"):
-        print("\n== Auth auto-restore ==")
-        return restore_official_auth(dry_run=dry_run)
+        warn(
+            "Live auth is not official, but a DB backup exists. Automatic restore is disabled "
+            "to prevent stale credentials from overwriting newer state. Review status and use "
+            "restore-auth or restore-auth-force explicitly."
+        )
+        return 2
 
     warn(
         "Auth is not official and no official backup exists. "
         "Sign in with ChatGPT once, confirm quota/account info appears, then run this BAT again."
     )
-    return 0
+    return 2
 
 
 def self_check() -> int:
@@ -2128,30 +2697,30 @@ def self_check() -> int:
     assert toml_value_from_line("CODEX_CLI_PATH = 'C:\\\\x\\\\codex.exe'\n", "CODEX_CLI_PATH") == "C:\\\\x\\\\codex.exe"
     assert "model_reasoning_effort" in SKIP_TOP_LEVEL_KEYS
     embedded = embedded_public_config()
-    assert toml_value_from_line(embedded, "model_reasoning_effort") == "ultra"
-    assert toml_value_from_line(embedded, "model_catalog_json") == str(
-        CODEX_HOME / "models-wooai-supported-v0.144.4.json"
-    )
+    assert toml_value_from_line(embedded, "model_reasoning_effort") == ""
+    assert toml_value_from_line(embedded, "model_catalog_json") == ""
+    assert toml_value_from_line(embedded, "cli_auth_credentials_store") == "file"
+    assert "show-ultra-in-model-picker-slider = true" in embedded
     public = extract_public_config(embedded)
     assert "model_reasoning_effort" not in public
-    assert "model_catalog_json" in public
+    assert "model_catalog_json" not in public
     grok, grok_changes = normalize_model_reasoning_effort(
         'model = "grok-4.5"\nmodel_reasoning_effort = "ultra"\n'
     )
     assert toml_value_from_line(grok, "model_reasoning_effort") == "high"
-    assert grok_changes == ["~ model_reasoning_effort (grok-4.5: high)"]
+    assert grok_changes == ["~ model_reasoning_effort (grok-4.5: ultra -> high)"]
     grok_medium = 'model = "grok-4.5"\nmodel_reasoning_effort = "medium"\n'
     assert normalize_model_reasoning_effort(grok_medium) == (grok_medium, [])
     sol, sol_changes = normalize_model_reasoning_effort(
         'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "xhigh"\n'
     )
-    assert toml_value_from_line(sol, "model_reasoning_effort") == "ultra"
-    assert sol_changes == ["~ model_reasoning_effort (gpt-5.6-sol: ultra)"]
+    assert toml_value_from_line(sol, "model_reasoning_effort") == "xhigh"
+    assert sol_changes == []
     sol_missing, sol_missing_changes = normalize_model_reasoning_effort(
         'model = "gpt-5.6-sol"\napproval_policy = "never"\n'
     )
-    assert toml_value_from_line(sol_missing, "model_reasoning_effort") == "ultra"
-    assert sol_missing_changes == ["~ model_reasoning_effort (gpt-5.6-sol: ultra)"]
+    assert toml_value_from_line(sol_missing, "model_reasoning_effort") == "max"
+    assert sol_missing_changes == ["~ model_reasoning_effort (gpt-5.6-sol: missing -> max)"]
     legacy = 'model = "gpt-5.5"\nmodel_reasoning_effort = "xhigh"\n'
     assert normalize_model_reasoning_effort(legacy) == (legacy, [])
     runtime = load_runtime_paths()
@@ -2159,7 +2728,7 @@ def self_check() -> int:
     assert Path(runtime["codexCliPath"]).name.lower() == "codex.exe" and Path(runtime["codexCliPath"]).exists(), runtime["codexCliPath"]
     assert "service_tier" not in embedded_public_config()
     merged, _changes = merge_public('service_tier = "priority"\n', "[features]\napps = false\n")
-    assert 'service_tier = "priority"' not in merged
+    assert 'service_tier = "priority"' in merged
     assert "[features]" in merged
     target = """model = "old"
 stale = true
@@ -2191,8 +2760,8 @@ command = "npx.cmd"
     assert "[projects.'c:\\x']" in mirrored
     assert "[mcp_servers.node_repl]" in mirrored
     assert "[mcp_servers.chrome_devtools]" in mirrored
-    assert '[hooks.state."old"]' not in mirrored
-    assert '[hooks.state."new"]' in mirrored
+    assert '[hooks.state."old"]' in mirrored
+    assert '[hooks.state."new"]' not in mirrored
     local_target = """model = "gpt-5.6-sol"
 
 [projects.'c:\\old']
@@ -2202,15 +2771,21 @@ trust_level = "trusted"
 
 [projects.'e:\\ideaprojects']
 trust_level = "trusted"
+
+[hooks.state."current"]
+trusted_hash = "sha256:current"
 """
     local_merged, local_changes = merge_local_shared_tables(local_target, local_source)
     assert "[projects.'c:\\old']" not in local_merged
     assert "[projects.'e:\\ideaprojects']" in local_merged
-    assert local_changes == ["~ local shared tables (projects)"]
-    assert merge_local_shared_tables(local_target, "approval_policy = \"never\"\n") == (
+    assert '[hooks.state."current"]' in local_merged
+    assert local_changes == ["~ local shared tables"]
+    local_cleared, local_clear_changes = merge_local_shared_tables(
         local_target,
-        [],
+        "approval_policy = \"never\"\n",
     )
+    assert "[projects." not in local_cleared
+    assert local_clear_changes == ["~ local shared tables"]
     text = read_text(LIVE_CONFIG)
     assert "apps = false" in text
     assert "mcp_servers.openaiDeveloperDocs" in text and "enabled = false" in text
@@ -2220,11 +2795,16 @@ trust_level = "trusted"
 
 def all_in_one(dry_run: bool = False) -> int:
     status()
-    print("\n== Runtime path auto-repair ==")
-    repair_runtime(dry_run=dry_run)
-    auto_auth(dry_run=dry_run)
+    auth_result = auto_auth(dry_run=dry_run)
+    if auth_result != 0:
+        warn("Stopping before runtime or public-config work because official live auth is not verified.")
+        return auth_result
     print("\n== Public config auto-repair ==")
-    return sync_public_config("auto", dry_run=dry_run)
+    sync_result = sync_public_config("auto", dry_run=dry_run)
+    if sync_result != 0:
+        return sync_result
+    print("\n== Runtime path auto-repair ==")
+    return repair_runtime(dry_run=dry_run)
 
 
 def main() -> int:
@@ -2242,7 +2822,9 @@ def main() -> int:
             "sync-live",
             "repair-runtime",
             "capture-auth",
+            "capture-auth-force",
             "restore-auth",
+            "restore-auth-force",
             "self-check",
             "all",
             "dry-run",
@@ -2258,15 +2840,28 @@ def main() -> int:
     if args.command == "status":
         return status()
     if args.command == "sync":
+        auth_result = auto_auth()
+        if auth_result != 0:
+            return auth_result
         return sync_public_config("auto")
     if args.command == "sync-live":
+        auth_result = auto_auth()
+        if auth_result != 0:
+            return auth_result
         return sync_public_config("live")
     if args.command == "repair-runtime":
+        auth_result = auto_auth()
+        if auth_result != 0:
+            return auth_result
         return repair_runtime()
     if args.command == "capture-auth":
         return capture_official_auth()
+    if args.command == "capture-auth-force":
+        return capture_official_auth(force=True)
     if args.command == "restore-auth":
         return restore_official_auth()
+    if args.command == "restore-auth-force":
+        return restore_official_auth(force=True)
     if args.command == "self-check":
         return self_check()
     if args.command in ("all", "auto"):
