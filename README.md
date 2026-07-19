@@ -7,6 +7,10 @@ restore references consistent on Windows.
 The BAT file contains an embedded Python program and requires Python 3 on
 `PATH`.
 
+For normal use, run the BAT with no arguments after either signing in again or
+editing `~/.codex/config.toml`. The script classifies and synchronizes the
+changes automatically; no command selection is required.
+
 ## Configuration boundaries
 
 The common CC Switch configuration contains settings that are safe to share
@@ -20,6 +24,12 @@ the common configuration:
 - provider URLs, bearer tokens, API keys, and authentication restrictions
 - project trust, hook trust state, profiles, and MCP environment tables
 - Node REPL runtime paths
+
+When the live config is complete and the current CC Switch provider can be
+identified unambiguously, model policy fields from live config are written back
+only to that current provider. Other providers keep their own model, reasoning
+levels, catalog, routing tables, and credentials. Missing live policy keys do
+not erase existing provider values.
 
 Project and hook trust tables are mirrored directly from live config into each
 local provider template, but never enter the common configuration. An empty
@@ -56,9 +66,12 @@ codex-ccswitch.bat self-check
 
 Running without a command is equivalent to `all`. It captures a current
 official login before any operation that may restart CC Switch, synchronizes
-public configuration, then repairs runtime paths. Before auth or runtime work
-restarts CC Switch, the current public and local trust state is merged into the
-proxy recovery snapshot so an older snapshot cannot roll back `config.toml`.
+public configuration and the current provider's model policy, then repairs
+runtime paths. Before auth or runtime work restarts CC Switch, a recovery
+snapshot is updated only when proxy takeover is enabled and the snapshot is a
+restorable non-proxy config. Routing, provider endpoints, bearer tokens, API
+keys, and inline CC Switch model catalogs are never copied from live into that
+snapshot.
 Automatic source selection only publishes a live config that still contains
 the expected approval, sandbox, desktop, and features sections; otherwise it
 falls back to the canonical snapshot. `sync-live` applies the same completeness

@@ -93,6 +93,15 @@ REASONING_POLICIES: dict[str, tuple[set[str], str]] = {
     "grok-4.5": ({"low", "medium", "high"}, "high"),
 }
 REASONING_LEVEL_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+CURRENT_PROVIDER_POLICY_KEYS = {
+    "model",
+    "model_reasoning_effort",
+    "model_catalog_json",
+    "service_tier",
+    "personality",
+    "plan_mode_reasoning_effort",
+}
+CURRENT_PROVIDER_POLICY_PREFIXES = ("model_", "review_model")
 TRUSTED_CATALOG_NAME_PATTERNS = (
     re.compile(r"^cc-switch-model-catalog(?:[-_.].*)?\.json$", re.IGNORECASE),
     re.compile(r"^models(?:[-_.].*)?\.json$", re.IGNORECASE),
@@ -720,6 +729,61 @@ def merge_public(target_text: str, source_text: str) -> tuple[str, list[str]]:
     return normalize_text(out), changes
 
 
+def is_current_provider_policy_key(key: str) -> bool:
+    lowered = key.lower()
+    if any(marker in lowered for marker in ("provider", "base_url", "endpoint", "wire_api", "auth")):
+        return False
+    if any(marker in lowered for marker in SENSITIVE_TOP_LEVEL_MARKERS):
+        return False
+    return key in CURRENT_PROVIDER_POLICY_KEYS or any(
+        key.startswith(prefix) for prefix in CURRENT_PROVIDER_POLICY_PREFIXES
+    )
+
+
+def merge_current_provider_policy(
+    target_text: str,
+    live_text: str,
+    include_catalog: bool = True,
+) -> tuple[str, list[str]]:
+    live_top, _live_tables = parse_into_blocks(live_text)
+    live_policy = [
+        (key, lines)
+        for key, lines in live_top
+        if is_current_provider_policy_key(key) and (include_catalog or key != "model_catalog_json")
+    ]
+    if not any(key == "model" for key, _lines in live_policy):
+        return target_text, []
+
+    target_top, target_tables = parse_into_blocks(target_text)
+    live_by_key = {key: lines for key, lines in live_policy}
+    new_top: list[tuple[str, list[str]]] = []
+    replaced: set[str] = set()
+    for key, lines in target_top:
+        source_lines = live_by_key.get(key)
+        if source_lines is None:
+            new_top.append((key, lines))
+            continue
+        if key not in replaced:
+            new_top.append((key, source_lines))
+            replaced.add(key)
+    new_top.extend((key, lines) for key, lines in live_policy if key not in replaced)
+
+    out: list[str] = []
+    for _key, lines in new_top:
+        out.extend(strip_blank_edges(lines))
+    if new_top and target_tables:
+        out.append("")
+    for idx, (_name, lines) in enumerate(target_tables):
+        out.extend(strip_blank_edges(lines))
+        if idx < len(target_tables) - 1:
+            out.append("")
+    updated = normalize_text(out)
+    if toml_semantically_equal(target_text, updated):
+        return target_text, []
+    parse_toml(updated, "current provider model policy")
+    return updated, ["~ current provider model policy"]
+
+
 def is_local_shared_table(name: str) -> bool:
     return (
         name == "projects"
@@ -761,15 +825,27 @@ def merge_local_shared_tables(target_text: str, source_text: str) -> tuple[str, 
     return normalize_text(out), ["~ local shared tables"]
 
 
-def merge_live_state_for_restart(target_text: str, live_text: str) -> tuple[str, list[str]]:
-    # The proxy backup owns provider/model routing. Only refresh provider-neutral
-    # settings and local trust state from live; live may contain takeover values.
+def merge_live_state_for_restart(
+    target_text: str,
+    live_text: str,
+    include_provider_policy: bool = False,
+    include_catalog: bool = True,
+) -> tuple[str, list[str]]:
+    # Provider routing tables always stay with the restore target. Callers may
+    # opt into copying the verified current-provider model policy.
     source_public = extract_public_config(live_text)
     retry_settings, _retry_source = extract_model_provider_retry_settings(live_text)
     updated, public_changes = merge_public(target_text, source_public)
     updated, local_changes = merge_local_shared_tables(updated, live_text)
     updated, retry_changes = merge_model_provider_retry_settings(updated, retry_settings)
-    changes = public_changes + local_changes + retry_changes
+    policy_changes: list[str] = []
+    if include_provider_policy:
+        updated, policy_changes = merge_current_provider_policy(
+            updated,
+            live_text,
+            include_catalog=include_catalog,
+        )
+    changes = public_changes + local_changes + retry_changes + policy_changes
     if updated != target_text:
         parse_toml(updated, "CC-Switch restart-preserved config")
     return updated, changes
@@ -1137,7 +1213,21 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def codex_state_fingerprint(conn: sqlite3.Connection) -> str:
+    try:
+        settings_file_hash = hashlib.sha256(CCSWITCH_SETTINGS.read_bytes()).hexdigest()
+    except OSError:
+        settings_file_hash = ""
+    try:
+        proxy_config_rows = [
+            list(row)
+            for row in conn.execute(
+                "SELECT * FROM proxy_config WHERE app_type = 'codex' ORDER BY app_type"
+            )
+        ]
+    except sqlite3.Error:
+        proxy_config_rows = []
     payload = {
+        "settings_file_sha256": settings_file_hash,
         "settings": [
             list(row)
             for row in conn.execute(
@@ -1149,7 +1239,7 @@ def codex_state_fingerprint(conn: sqlite3.Connection) -> str:
             list(row)
             for row in conn.execute(
                 """
-                SELECT id, settings_config, meta
+                SELECT id, settings_config, meta, is_current
                 FROM providers
                 WHERE app_type = 'codex'
                 ORDER BY id
@@ -1162,6 +1252,7 @@ def codex_state_fingerprint(conn: sqlite3.Connection) -> str:
                 "SELECT app_type, original_config FROM proxy_live_backup WHERE app_type = 'codex'"
             )
         ],
+        "proxy_config": proxy_config_rows,
     }
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -1589,18 +1680,33 @@ def repair_runtime(dry_run: bool = False) -> int:
         row = conn.execute("SELECT original_config FROM proxy_live_backup WHERE app_type='codex'").fetchone()
         if row:
             original_config = read_json_object(row["original_config"], "proxy_live_backup:codex")
-            config = original_config.get("config") if isinstance(original_config.get("config"), str) else ""
-            preserved, _preserve_details = merge_live_state_for_restart(config, live_new)
-            if not toml_semantically_equal(config, preserved):
-                proxy_changes.append("~ public/local restart snapshot")
-            repaired, runtime_changed = replace_node_repl_bundle(preserved, new_bundle)
-            runtime_changed = runtime_changed and not toml_semantically_equal(preserved, repaired)
-            if runtime_changed:
-                proxy_changes.append("~ [mcp_servers.node_repl]")
-            if not toml_semantically_equal(config, repaired):
-                parse_toml(repaired, "proxy_live_backup codex config")
-                original_config["config"] = repaired
-                proxy_update = json.dumps(original_config, ensure_ascii=False, separators=(",", ":"))
+            if proxy_backup_config_patch_allowed(conn, original_config, report_drift=True):
+                config = original_config.get("config") if isinstance(original_config.get("config"), str) else ""
+                preserved = config
+                if public_config_looks_complete(extract_public_config(live_new)):
+                    current_id, current_policy_text = prepare_current_provider_policy_source(
+                        conn,
+                        live_new,
+                        report_drift=True,
+                    )
+                    preserved, _preserve_details = merge_live_state_for_restart(
+                        config,
+                        current_policy_text or live_new,
+                        include_provider_policy=bool(current_id and current_policy_text),
+                        include_catalog="modelCatalog" not in original_config,
+                    )
+                else:
+                    warn("Live public config is incomplete; preserving only the runtime block in the restore snapshot.")
+                if not toml_semantically_equal(config, preserved):
+                    proxy_changes.append("~ safe restart snapshot")
+                repaired, runtime_changed = replace_node_repl_bundle(preserved, new_bundle)
+                runtime_changed = runtime_changed and not toml_semantically_equal(preserved, repaired)
+                if runtime_changed:
+                    proxy_changes.append("~ [mcp_servers.node_repl]")
+                if not toml_semantically_equal(config, repaired):
+                    parse_toml(repaired, "proxy_live_backup codex config")
+                    original_config["config"] = repaired
+                    proxy_update = json.dumps(original_config, ensure_ascii=False, separators=(",", ":"))
         planned_state = codex_state_fingerprint(conn)
     finally:
         conn.close()
@@ -1677,6 +1783,142 @@ def public_config_looks_complete(public_text: str) -> bool:
     )
 
 
+def settings_current_codex_provider_id(report_drift: bool = False) -> str:
+    if not CCSWITCH_SETTINGS.exists():
+        return ""
+    try:
+        settings = json.loads(CCSWITCH_SETTINGS.read_text(encoding="utf-8"))
+    except Exception as exc:
+        if report_drift:
+            warn(f"Could not read currentProviderCodex from {CCSWITCH_SETTINGS}: {exc}")
+        return ""
+    if not isinstance(settings, dict):
+        if report_drift:
+            warn(f"Expected a JSON object in {CCSWITCH_SETTINGS}; ignoring its current provider pointer.")
+        return ""
+    return str(settings.get("currentProviderCodex") or "").strip()
+
+
+def current_codex_provider_id(conn: sqlite3.Connection, report_drift: bool = False) -> str:
+    settings_id = settings_current_codex_provider_id(report_drift=report_drift)
+    db_current_ids = [
+        str(row["id"])
+        for row in conn.execute(
+            """
+            SELECT id
+            FROM providers
+            WHERE app_type = 'codex' AND is_current = 1
+            ORDER BY sort_index, id
+            """
+        ).fetchall()
+    ]
+
+    if settings_id:
+        exists = conn.execute(
+            "SELECT 1 FROM providers WHERE id = ? AND app_type = 'codex'",
+            (settings_id,),
+        ).fetchone()
+        if exists:
+            if report_drift and (len(db_current_ids) != 1 or db_current_ids[0] != settings_id):
+                warn(
+                    "CC-Switch current-provider markers disagree; using "
+                    f"settings.json currentProviderCodex={settings_id}."
+                )
+            return settings_id
+        if report_drift:
+            warn(
+                f"settings.json points to missing Codex provider {settings_id}; "
+                "falling back to providers.is_current."
+            )
+
+    if len(db_current_ids) == 1:
+        return db_current_ids[0]
+    if len(db_current_ids) > 1 and report_drift:
+        warn(
+            "Multiple Codex providers are marked is_current and settings.json has no valid pointer; "
+            "skipping current-provider policy capture rather than guessing."
+        )
+    return ""
+
+
+def prepare_current_provider_policy_source(
+    conn: sqlite3.Connection,
+    live_text: str,
+    report_drift: bool = False,
+) -> tuple[str, str]:
+    public_text = extract_public_config(live_text)
+    if not live_text.strip() or not public_config_looks_complete(public_text):
+        return "", ""
+    if not top_level_toml_value(live_text, "model"):
+        return "", ""
+    current_id = current_codex_provider_id(conn, report_drift=report_drift)
+    if not current_id:
+        if report_drift:
+            warn("No unambiguous current Codex provider; skipping provider-specific model policy capture.")
+        return "", ""
+    policy_source, _catalog_changes = repair_model_catalog_reference(live_text)
+    policy_source, _reasoning_changes = normalize_model_reasoning_effort(policy_source)
+    return current_id, policy_source
+
+
+def proxy_takeover_enabled(conn: sqlite3.Connection) -> bool:
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(proxy_config)").fetchall()
+        }
+    except sqlite3.Error:
+        return False
+    enabled_columns = [name for name in ("enabled", "proxy_enabled") if name in columns]
+    if "app_type" not in columns or not enabled_columns:
+        return False
+    try:
+        row = conn.execute(
+            f"SELECT {', '.join(enabled_columns)} FROM proxy_config WHERE app_type = ?",
+            ("codex",),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    if not row:
+        return False
+    return any(str(row[name]).strip().lower() in {"1", "true", "yes", "on"} for name in enabled_columns)
+
+
+def config_has_proxy_takeover_placeholder(config_text: str) -> bool:
+    lowered = config_text.lower()
+    if "proxy_managed" in lowered:
+        return True
+    endpoint_pattern = re.compile(
+        r'''(?mi)^\s*(?:base_url|openai_base_url|chatgpt_base_url)\s*=\s*["']([^"']+)["']'''
+    )
+    for match in endpoint_pattern.finditer(config_text):
+        endpoint = match.group(1).strip().lower()
+        if any(marker in endpoint for marker in ("127.0.0.1", "localhost", "[::1]")):
+            return True
+    return False
+
+
+def proxy_backup_config_patch_allowed(
+    conn: sqlite3.Connection,
+    original_config: dict[str, Any],
+    report_drift: bool = False,
+) -> bool:
+    if not proxy_takeover_enabled(conn):
+        if report_drift:
+            warn("CC-Switch proxy takeover is not enabled; leaving proxy_live_backup config untouched.")
+        return False
+    config_text = original_config.get("config")
+    if not isinstance(config_text, str) or not config_text.strip():
+        if report_drift:
+            warn("proxy_live_backup has no restorable Codex config; leaving it untouched.")
+        return False
+    if config_has_proxy_takeover_placeholder(config_text):
+        if report_drift:
+            warn("proxy_live_backup contains a proxy placeholder; refusing to preserve it as a restore target.")
+        return False
+    return True
+
+
 def choose_public_source(conn: sqlite3.Connection, source: str) -> tuple[str, str]:
     if source == "embedded":
         text = embedded_public_config()
@@ -1716,6 +1958,8 @@ def collect_template_repairs(
     source_text: str,
     local_shared_text: str,
     retry_settings: dict[str, list[str]],
+    current_provider_id_value: str = "",
+    current_policy_text: str = "",
 ):
     provider_updates = []
     backup_update = None
@@ -1740,6 +1984,9 @@ def collect_template_repairs(
         new_config, merge_changes = merge_public(old_config, source_text)
         new_config, local_changes = merge_local_shared_tables(new_config, local_shared_text)
         new_config, retry_changes = merge_model_provider_retry_settings(new_config, retry_settings)
+        policy_changes: list[str] = []
+        if current_policy_text and row["id"] == current_provider_id_value:
+            new_config, policy_changes = merge_current_provider_policy(new_config, current_policy_text)
         new_config, catalog_changes = repair_model_catalog_reference(new_config)
         new_config, reasoning_changes = normalize_model_reasoning_effort(new_config)
         if new_config != old_config:
@@ -1748,8 +1995,9 @@ def collect_template_repairs(
             changes.extend(merge_changes)
             changes.extend(local_changes)
             changes.extend(retry_changes)
-            changes.extend(reasoning_changes)
+            changes.extend(policy_changes)
             changes.extend(catalog_changes)
+            changes.extend(reasoning_changes)
 
         if meta.get("commonConfigEnabled") is not True:
             meta["commonConfigEnabled"] = True
@@ -1769,25 +2017,36 @@ def collect_template_repairs(
     row = conn.execute("SELECT original_config FROM proxy_live_backup WHERE app_type = 'codex'").fetchone()
     if row:
         original_config = read_json_object(row["original_config"], "proxy_live_backup:codex")
-        old_config = original_config.get("config") or ""
-        if not isinstance(old_config, str):
-            old_config = ""
-        new_config, changes = merge_public(old_config, source_text)
-        new_config, local_changes = merge_local_shared_tables(new_config, local_shared_text)
-        new_config, retry_changes = merge_model_provider_retry_settings(new_config, retry_settings)
-        new_config, catalog_changes = repair_model_catalog_reference(new_config)
-        new_config, reasoning_changes = normalize_model_reasoning_effort(new_config)
-        changes.extend(local_changes)
-        changes.extend(retry_changes)
-        changes.extend(reasoning_changes)
-        changes.extend(catalog_changes)
-        if new_config != old_config:
-            parse_toml(new_config, "proxy_live_backup codex config")
-            original_config["config"] = new_config
-            backup_update = (
-                json.dumps(original_config, ensure_ascii=False, separators=(",", ":")),
-                changes,
-            )
+        if proxy_backup_config_patch_allowed(conn, original_config, report_drift=True):
+            old_config = original_config.get("config") or ""
+            if not isinstance(old_config, str):
+                old_config = ""
+            new_config, changes = merge_public(old_config, source_text)
+            new_config, local_changes = merge_local_shared_tables(new_config, local_shared_text)
+            new_config, retry_changes = merge_model_provider_retry_settings(new_config, retry_settings)
+            policy_changes: list[str] = []
+            if current_policy_text and current_provider_id_value:
+                new_config, policy_changes = merge_current_provider_policy(
+                    new_config,
+                    current_policy_text,
+                    include_catalog="modelCatalog" not in original_config,
+                )
+            catalog_changes: list[str] = []
+            if "modelCatalog" not in original_config:
+                new_config, catalog_changes = repair_model_catalog_reference(new_config)
+            new_config, reasoning_changes = normalize_model_reasoning_effort(new_config)
+            changes.extend(local_changes)
+            changes.extend(retry_changes)
+            changes.extend(policy_changes)
+            changes.extend(catalog_changes)
+            changes.extend(reasoning_changes)
+            if new_config != old_config:
+                parse_toml(new_config, "proxy_live_backup codex config")
+                original_config["config"] = new_config
+                backup_update = (
+                    json.dumps(original_config, ensure_ascii=False, separators=(",", ":")),
+                    changes,
+                )
 
     return provider_updates, backup_update
 
@@ -1818,9 +2077,19 @@ def sync_public_config(source: str, dry_run: bool = False) -> int:
         live_new, live_catalog_changes = repair_model_catalog_reference(live_new)
         live_new, live_reasoning_changes = normalize_model_reasoning_effort(live_new)
         live_changes.extend(live_retry_changes)
-        live_changes.extend(live_reasoning_changes)
         live_changes.extend(live_catalog_changes)
+        live_changes.extend(live_reasoning_changes)
         parse_toml(live_new, "merged live config")
+
+        current_id = ""
+        current_policy_text = ""
+        live_public_was_complete = public_config_looks_complete(extract_public_config(live_text))
+        if source in ("auto", "live") and live_public_was_complete:
+            current_id, current_policy_text = prepare_current_provider_policy_source(
+                conn,
+                live_new,
+                report_drift=True,
+            )
 
         common_old = get_setting(conn, SETTING_COMMON)
         canonical_old = get_setting(conn, SETTING_CANONICAL)
@@ -1831,10 +2100,16 @@ def sync_public_config(source: str, dry_run: bool = False) -> int:
             source_text,
             live_text,
             retry_settings,
+            current_provider_id_value=current_id,
+            current_policy_text=current_policy_text,
         )
         planned_state = codex_state_fingerprint(conn)
 
         info(f"Public config source: {source_label}")
+        if current_policy_text:
+            info(f"Current provider policy source: live config -> {current_id}")
+        else:
+            info("Current provider policy source: not captured")
         if retry_settings:
             keys = ", ".join(retry_settings)
             info(f"Model provider retry source: {retry_source_label} ({keys})")
@@ -2188,6 +2463,52 @@ def repair_official_auth_references(
                 ),
             )
 
+    current_id = ""
+    current_policy_text = ""
+    live_text = read_text(LIVE_CONFIG) if preserve_live_config and LIVE_CONFIG.exists() else ""
+    if live_text:
+        current_id, current_policy_text = prepare_current_provider_policy_source(
+            conn,
+            live_text,
+            report_drift=True,
+        )
+    if current_id and current_policy_text:
+        current_row = conn.execute(
+            "SELECT name, settings_config FROM providers WHERE id = ? AND app_type = 'codex'",
+            (current_id,),
+        ).fetchone()
+        if current_row:
+            current_settings = read_json_object(
+                current_row["settings_config"],
+                f"provider:{current_id}:settings_config",
+            )
+            old_current_config = (
+                current_settings.get("config")
+                if isinstance(current_settings.get("config"), str)
+                else ""
+            )
+            new_current_config, policy_changes = merge_current_provider_policy(
+                old_current_config,
+                current_policy_text,
+            )
+            new_current_config, catalog_changes = repair_model_catalog_reference(new_current_config)
+            new_current_config, reasoning_changes = normalize_model_reasoning_effort(new_current_config)
+            if not toml_semantically_equal(old_current_config, new_current_config):
+                parse_toml(
+                    new_current_config,
+                    f"current provider {current_row['name']} ({current_id}) policy",
+                )
+                changes.extend(policy_changes + catalog_changes + reasoning_changes)
+                if not dry_run:
+                    current_settings["config"] = new_current_config
+                    conn.execute(
+                        "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = 'codex'",
+                        (
+                            json.dumps(current_settings, ensure_ascii=False, separators=(",", ":")),
+                            current_id,
+                        ),
+                    )
+
     row = conn.execute(
         "SELECT original_config FROM proxy_live_backup WHERE app_type = 'codex'"
     ).fetchone()
@@ -2199,12 +2520,22 @@ def repair_official_auth_references(
             changes.append("~ proxy_live_backup codex auth")
             original_config["auth"] = official_auth
             proxy_changed = True
-        if preserve_live_config and LIVE_CONFIG.exists():
+        if (
+            preserve_live_config
+            and live_text
+            and public_config_looks_complete(extract_public_config(live_text))
+            and proxy_backup_config_patch_allowed(conn, original_config, report_drift=True)
+        ):
             old_config = original_config.get("config") if isinstance(original_config.get("config"), str) else ""
-            live_text = read_text(LIVE_CONFIG)
-            preserved_config, _preserve_changes = merge_live_state_for_restart(old_config, live_text)
+            restart_source = current_policy_text or live_text
+            preserved_config, _preserve_changes = merge_live_state_for_restart(
+                old_config,
+                restart_source,
+                include_provider_policy=bool(current_policy_text and current_id),
+                include_catalog="modelCatalog" not in original_config,
+            )
             if not toml_semantically_equal(old_config, preserved_config):
-                changes.append("~ proxy_live_backup codex public/local config")
+                changes.append("~ proxy_live_backup codex safe restart config")
                 original_config["config"] = preserved_config
                 proxy_changed = True
         if proxy_changed and not dry_run:
@@ -2219,12 +2550,19 @@ def repair_official_auth_references(
                     _dt.datetime.now(_dt.timezone.utc).isoformat(),
                 ),
             )
-    else:
+    elif proxy_takeover_enabled(conn):
+        candidate_config = read_text(LIVE_CONFIG) if LIVE_CONFIG.exists() else ""
+        if not candidate_config.strip() or config_has_proxy_takeover_placeholder(candidate_config):
+            warn(
+                "CC-Switch proxy takeover is enabled but no safe Codex restore snapshot exists; "
+                "refusing to create one from a proxy placeholder."
+            )
+            return changes
         changes.append("+ proxy_live_backup codex")
         if not dry_run:
             original_config = {
                 "auth": official_auth,
-                "config": read_text(LIVE_CONFIG) if LIVE_CONFIG.exists() else "",
+                "config": candidate_config,
             }
             conn.execute(
                 """
@@ -2441,20 +2779,7 @@ def restore_official_auth(dry_run: bool = False, force: bool = False) -> int:
 
 
 def get_current_codex_provider_summary(conn: sqlite3.Connection) -> dict[str, Any]:
-    settings_path = CCSWITCH_SETTINGS
-    current = ""
-    if settings_path.exists():
-        try:
-            settings = json.loads(settings_path.read_text(encoding="utf-8"))
-            if isinstance(settings, dict):
-                current = str(settings.get("currentProviderCodex") or "")
-        except Exception:
-            current = ""
-    if not current:
-        row = conn.execute(
-            "SELECT id FROM providers WHERE app_type='codex' AND is_current=1 LIMIT 1"
-        ).fetchone()
-        current = row["id"] if row else ""
+    current = current_codex_provider_id(conn, report_drift=True)
     if not current:
         return {}
     row = conn.execute(
